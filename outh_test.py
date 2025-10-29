@@ -1,8 +1,10 @@
 import requests
 import webbrowser
 import base64
+import hashlib
 import json
 import time
+import secrets
 from flask import Flask, request, make_response, redirect, url_for
 
 app = Flask(__name__)
@@ -19,11 +21,21 @@ def load_config():
 
 config = load_config()
 CLIENT_ID = config['client_id']
-CLIENT_SECRET = config['client_secret']
+CLIENT_SECRET = config.get('client_secret', '')
 AUTHORIZATION_ENDPOINT = config['authorization_endpoint']
 TOKEN_ENDPOINT = config['token_endpoint']
 REDIRECT_URI = "http://localhost:5555/callback"
 SCOPES = config['scopes']
+USE_PKCE = config.get('use_pkce', True)  # switch via config file
+
+# === PKCE UTILS ===
+def generate_pkce_pair():
+    code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(64)).rstrip(b'=').decode('utf-8')
+    code_challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(code_verifier.encode('utf-8')).digest()
+    ).rstrip(b'=').decode('utf-8')
+    return code_verifier, code_challenge
+
 
 def decode_jwt(jwt_token):
     try:
@@ -37,17 +49,38 @@ def decode_jwt(jwt_token):
         return {"error": f"Failed to decode JWT: {str(e)}"}
 
 
+# === GLOBAL STATE ===
+latest_tokens = {}
+received_at = 0
+pkce_code_verifier = None
+oauth_state = None
+
+
 @app.route('/')
 def index():
+    global pkce_code_verifier, oauth_state
+
+    # Optional PKCE setup
+    code_challenge = None
+    if USE_PKCE:
+        pkce_code_verifier, code_challenge = generate_pkce_pair()
+    oauth_state = base64.urlsafe_b64encode(secrets.token_bytes(16)).rstrip(b'=').decode('utf-8')
+
+    # Build authorization URL
     auth_url = (
         f"{AUTHORIZATION_ENDPOINT}?"
         f"response_type=code&"
         f"client_id={CLIENT_ID}&"
         f"redirect_uri={REDIRECT_URI}&"
         #f"provider=google&"
-        f"prompt=login&"
-        f"scope={SCOPES}"
+        f"scope={SCOPES}&"
+        f"state={oauth_state}&"
+        f"prompt=login"
     )
+
+    if USE_PKCE:
+        auth_url += f"&code_challenge={code_challenge}&code_challenge_method=S256"
+
     print("Open the following URL in your browser:")
     print(auth_url)
     webbrowser.open(auth_url)
@@ -56,49 +89,66 @@ def index():
 
 @app.route('/callback')
 def callback():
-    global latest_tokens, received_at
+    global latest_tokens, received_at, pkce_code_verifier, oauth_state
+
+    error = request.args.get('error')
+    if error:
+        desc = request.args.get('error_description', '')
+        return f"Authorization failed: {error} - {desc}", 400
+
     code = request.args.get('code')
     if not code:
         return "Authorization failed. No code provided.", 400
 
+    returned_state = request.args.get('state')
+    if not returned_state or returned_state != oauth_state:
+        return f"State mismatch or missing. Expected: {oauth_state}, got: {returned_state}", 400
+
+    # Build token request payload
     data = {
         'grant_type': 'authorization_code',
         'code': code,
         'redirect_uri': REDIRECT_URI,
         'client_id': CLIENT_ID,
-        'client_secret': CLIENT_SECRET,
     }
 
-    token_response = requests.post(TOKEN_ENDPOINT, data=data)
-    if token_response.status_code != 200:
-        return f"Token request failed: {token_response.text}", 500
+    if USE_PKCE:
+        data['code_verifier'] = pkce_code_verifier
 
-    latest_tokens = token_response.json()
-    received_at = int(time.time())
-    return redirect(url_for('display_tokens'))
+    # Only include client_secret if it exists and PKCE-only mode isn’t set
+    if CLIENT_SECRET and not USE_PKCE:
+        data['client_secret'] = CLIENT_SECRET
 
-
-@app.route('/refresh')
-def refresh():
-    global latest_tokens, received_at
-    refresh_token = latest_tokens.get('refresh_token')
-    if not refresh_token:
-        return "No refresh token available.", 400
-
-    data = {
-        'grant_type': 'refresh_token',
-        'refresh_token': refresh_token,
-        'client_id': CLIENT_ID,
-        'client_secret': CLIENT_SECRET,
+    headers = {
+        "accept": "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
     }
 
-    token_response = requests.post(TOKEN_ENDPOINT, data=data)
+    print("\n--- Token Exchange Attempt ---")
+    print(f"Using PKCE: {USE_PKCE}")
+    print(f"Payload (without secret): {json.dumps({k: v for k, v in data.items() if k != 'client_secret'}, indent=2)}")
+
+    token_response = requests.post(TOKEN_ENDPOINT, data=data, headers=headers)
+
+    # If provider rejects with invalid_client, retry without secret
+    if (
+        token_response.status_code in (400, 401)
+        and "invalid_client" in token_response.text.lower()
+        and "client_secret" in data
+    ):
+        print("Provider rejected client_secret — retrying token request without it.")
+        data.pop("client_secret", None)
+        token_response = requests.post(TOKEN_ENDPOINT, data=data, headers=headers)
+
     if token_response.status_code != 200:
         return f"Token refresh failed: {token_response.text}", 500
 
-    new_tokens = token_response.json()
-    latest_tokens.update(new_tokens)
+    latest_tokens = token_response.json()
     received_at = int(time.time())
+
+    print("\nToken exchange succeeded:")
+    print(json.dumps(latest_tokens, indent=2))
+
     return redirect(url_for('display_tokens'))
 
 @app.route('/logout')
@@ -135,6 +185,31 @@ def backchannel():
         form_data = None
 
     return "Backchannel logout processed.", 200
+
+@app.route('/refresh')
+def refresh():
+    global latest_tokens, received_at
+    refresh_token = latest_tokens.get('refresh_token')
+    if not refresh_token:
+        return "No refresh token available.", 400
+
+    data = {
+        'grant_type': 'refresh_token',
+        'refresh_token': refresh_token,
+        'client_id': CLIENT_ID,
+    }
+
+    if CLIENT_SECRET:
+        data['client_secret'] = CLIENT_SECRET
+
+    token_response = requests.post(TOKEN_ENDPOINT, data=data)
+    if token_response.status_code != 200:
+        return f"Token refresh failed: {token_response.text}", 500
+
+    new_tokens = token_response.json()
+    latest_tokens.update(new_tokens)
+    received_at = int(time.time())
+    return redirect(url_for('display_tokens'))
 
 
 @app.route('/tokens')
@@ -179,6 +254,7 @@ def display_tokens():
         </head>
         <body>
             <h2>OAuth2 Tokens</h2>
+            <p><b>Using PKCE:</b> {USE_PKCE}</p>
 
             <h3>ID Token</h3>
             <table>
