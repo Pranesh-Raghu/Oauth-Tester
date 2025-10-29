@@ -1,0 +1,8 @@
+{
+    "client_id": "YOUR_CLIENT_ID",
+    "client_secret": "YOUR_CLIENT_SECRET",
+    "authorization_endpoint": "YOUR_AUTHORIZATION_ENDPOINT",
+    "token_endpoint": "YOUR_TOKEN_ENDPOINT",
+    "scopes": "openid profile email offline_access",
+    "include_client_secret": false
+}
